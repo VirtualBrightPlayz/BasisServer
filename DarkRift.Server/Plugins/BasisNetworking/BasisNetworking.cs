@@ -23,6 +23,7 @@ namespace DarkRift.Server.Plugins.Commands
         public override Command[] Commands => new Command[] { };
         internal override bool Hidden => false;
         public static BasisNetworking Instance;
+        public IServerAuthChallengeFactory serverAuthFactory = new ExampleServerAuthFactory();
 
         public static byte EventsChannel = 0;
         public static byte MovementChannel = 1;
@@ -33,6 +34,8 @@ namespace DarkRift.Server.Plugins.Commands
         /// this is clients that have gone past the ReadyStateTag
         /// </summary>
         public static ConcurrentDictionary<ushort, IClient> ReadyClients = new ConcurrentDictionary<ushort, IClient>();
+        public static ConcurrentDictionary<ushort, ServerAuthChallenge> AuthenticatingClients = new ConcurrentDictionary<ushort, ServerAuthChallenge>();
+        public static ConcurrentDictionary<ushort, IClient> AuthenticatedClients = new ConcurrentDictionary<ushort, IClient>();
         public BasisNetworking(PluginLoadData pluginLoadData) : base(pluginLoadData)
         {
             Instance = this;
@@ -41,13 +44,6 @@ namespace DarkRift.Server.Plugins.Commands
         }
         private void ClientConnected(object sender, ClientConnectedEventArgs e)
         {
-            using (DarkRiftWriter writer = DarkRiftWriter.Create())
-            {
-                using (Message authenticatedMessage = Message.Create(BasisTags.AuthSuccess, writer))
-                {
-                    e.Client.SendMessage(authenticatedMessage, EventsChannel, DeliveryMethod.ReliableOrdered);
-                }
-            }
             e.Client.MessageReceived += MessageReceived;
         }
         private void ClientDisconnected(object sender, ClientDisconnectedEventArgs e)
@@ -55,12 +51,28 @@ namespace DarkRift.Server.Plugins.Commands
             ownershipManagement.RemovePlayerOwnership(e.Client.ID);
             basisSavedState.RemovePlayer(e.Client);
             ReadyClients.TryRemove(e.Client.ID, out IClient removedclient);
+            AuthenticatingClients.TryRemove(e.Client.ID, out _);
+            AuthenticatedClients.TryRemove(e.Client.ID, out _);
             ClientDisconnection.ClientDisconnect(e, EventsChannel, ReadyClients);
         }
         public void MessageReceived(object sender, MessageReceivedEventArgs e)
         {
             using (Message message = e.GetMessage())
             {
+                if (message.Tag == BasisTags.AuthIdentity)
+                {
+                    HandleAuthIdentity(message, e);
+                    return;
+                }
+                if (message.Tag == BasisTags.AuthChallengeResponse)
+                {
+                    HandleChallengeResponse(message, e);
+                    return;
+                }
+                else if (AuthenticatedClients.ContainsKey(e.Client.ID) == false)
+                {
+                    return;
+                }
                 switch (message.Tag)
                 {
                     case BasisTags.AvatarMuscleUpdateTag:
@@ -129,6 +141,54 @@ namespace DarkRift.Server.Plugins.Commands
                     default:
                         Logger.Log($"Message was received but no handler exists for tag {message.Tag}", LogType.Error);
                         break;
+                }
+            }
+        }
+        private void HandleAuthIdentity(Message message, MessageReceivedEventArgs e)
+        {
+            if (AuthenticatedClients.ContainsKey(e.Client.ID) == false && AuthenticatingClients.ContainsKey(e.Client.ID) == false)
+            {
+                using (DarkRiftReader reader = message.GetReader())
+                {
+                    string publicIdentity = reader.ReadString();
+                    ServerAuthChallenge challenge = serverAuthFactory.CreateAuthChallenge(publicIdentity);
+                    AuthenticatingClients.TryAdd(e.Client.ID, challenge);
+                    using (DarkRiftWriter writer = DarkRiftWriter.Create())
+                    {
+                        writer.Write(challenge.Serialize());
+                        using (Message authenticatedMessage = Message.Create(BasisTags.AuthChallenge, writer))
+                        {
+                            e.Client.SendMessage(authenticatedMessage, EventsChannel, DeliveryMethod.ReliableOrdered);
+                        }
+                    }
+                }
+            }
+        }
+        private void HandleChallengeResponse(Message message, MessageReceivedEventArgs e)
+        {
+            if (AuthenticatedClients.ContainsKey(e.Client.ID) == false && AuthenticatingClients.ContainsKey(e.Client.ID) == true)
+            {
+                using (DarkRiftReader reader = message.GetReader())
+                {
+                    byte[] challengeResponse = reader.ReadBytes();
+                    ServerAuthChallenge challenge = AuthenticatingClients[e.Client.ID];
+                    if (challenge.ValidateResponse(challengeResponse) == true)
+                    {
+                        AuthenticatingClients.TryRemove(e.Client.ID, out _);
+                        AuthenticatedClients.TryAdd(e.Client.ID, e.Client);
+                        using (DarkRiftWriter writer = DarkRiftWriter.Create())
+                        {
+                            using (Message authenticatedMessage = Message.Create(BasisTags.AuthSuccess, writer))
+                            {
+                                e.Client.SendMessage(authenticatedMessage, EventsChannel, DeliveryMethod.ReliableOrdered);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        Logger.Log($"Player failed to authenticate correctly.", LogType.Info);
+                        e.Client.Disconnect();
+                    }
                 }
             }
         }

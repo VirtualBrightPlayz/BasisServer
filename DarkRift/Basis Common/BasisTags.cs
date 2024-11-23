@@ -29,5 +29,9 @@
         // New additions for Recipients but No Payload
         public const ushort AvatarGenericMessage_Recipients_NoPayload = 20;
         public const ushort SceneGenericMessage_Recipients_NoPayload = 21;
+
+        public const ushort AuthChallenge = 22;
+        public const ushort AuthChallengeResponse = 23;
+        public const ushort AuthIdentity = 24;
     }
 }
